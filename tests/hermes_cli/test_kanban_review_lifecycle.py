@@ -483,6 +483,35 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_allows_explicit_review_rework(
+    kanban_home: Path,
+) -> None:
+    """An existing PR is the target of requested changes, not a duplicate."""
+    pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="revise PR", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kb.add_comment(conn, task_id, author="worker", body=pr_comment)
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="PR ready",
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer_claim = kb.claim_review_task(conn, task_id)
+        assert reviewer_claim is not None
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="format the changed document",
+            expected_run_id=reviewer_claim.current_run_id,
+        )[0]
+
+        assert kbd.check_respawn_guard(conn, task_id) is None
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

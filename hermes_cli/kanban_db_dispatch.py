@@ -1443,7 +1443,21 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. An explicit review-to-implementation transition is deliberate rework
+    #    on the existing PR, so the PR guard must not strand the ready card.
+    latest_review_transition = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "AND kind IN ('review_requested', 'changes_requested', 'review_reopened') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest_review_transition is not None and latest_review_transition["kind"] in {
+        "changes_requested",
+        "review_reopened",
+    }:
+        return None
+
+    # 5. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
