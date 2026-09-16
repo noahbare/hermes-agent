@@ -400,8 +400,16 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     if not task or not task.goal_mode or not _goal_judge_available():
         return
     try:
+        goal = f"{task.title}\n\n{task.body or ''}".strip()
+        if tool_name == "kanban_request_review":
+            goal += (
+                "\n\nREVIEW-HANDOFF STAGE: Judge only whether the implementation, publication, "
+                "and pre-review verification are complete enough to begin independent review. "
+                "Independent approval and merge are downstream review-stage actions and must not "
+                "be treated as missing from this handoff."
+            )
         verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+            goal=goal, last_response=evidence.strip())
     except Exception as judge_exc:
         logger.warning(
             "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
