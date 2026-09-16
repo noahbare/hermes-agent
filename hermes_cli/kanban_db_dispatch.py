@@ -2555,6 +2555,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # File tools accept absolute model-supplied paths. Constrain dispatcher-owned
+    # workers to the same workspace as the terminal so an absolute path cannot
+    # silently write into the main checkout while the task owns a worktree.
+    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+        env["HERMES_WRITE_SAFE_ROOT"] = workspace
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"

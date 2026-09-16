@@ -90,6 +90,23 @@ def test_absolute_terminal_cwd_used_verbatim(_isolated_cwd, monkeypatch):
     assert resolved == (workspace / "target.py")
 
 
+def test_kanban_workspace_overrides_session_drift_and_rejects_absolute_escape(
+    _isolated_cwd, monkeypatch
+):
+    """A dispatcher-owned worker cannot read or write through the main checkout."""
+    workspace, decoy = _isolated_cwd
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_example")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+    terminal_tool.record_session_cwd("default", str(decoy))
+
+    assert ftp._resolve_path_for_task("target.py", task_id="default") == (
+        workspace / "target.py"
+    )
+    with pytest.raises(PermissionError, match="outside the assigned workspace"):
+        ftp._resolve_path_for_task(str(decoy / "target.py"), task_id="default")
+
+
 def test_container_absolute_input_path_does_not_follow_host_symlink(tmp_path, monkeypatch):
     """Docker paths are sandbox-local and must not be host-dereferenced.
 

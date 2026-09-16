@@ -120,6 +120,17 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     ``cd`` never leaks into another); (2) a registered raw-keyed cwd override
     (TUI/Desktop/ACP); (3) a sentinel-free absolute ``$TERMINAL_CWD``.
     """
+    # Dispatcher-owned Kanban tasks have an immutable workspace contract. A
+    # terminal `cd` must never retarget relative file-tool operations away from
+    # the task's assigned worktree.
+    kanban_workspace = _sentinel_free_abs_cwd(
+        os.getenv("HERMES_KANBAN_WORKSPACE")
+        if os.getenv("HERMES_KANBAN_TASK")
+        else None
+    )
+    if kanban_workspace:
+        return kanban_workspace
+
     try:
         from tools.terminal_tool import get_session_cwd
 
@@ -173,8 +184,24 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     """Resolve *filepath* against the task's absolute base directory
     (absolute inputs are returned resolved-but-unanchored)."""
     container_paths = _uses_container_paths(task_id)
-    return _anchor(_host_text(filepath, container_paths),
-                   lambda: _resolve_base_dir(task_id, container_paths=container_paths), container_paths)
+    resolved = _anchor(
+        _host_text(filepath, container_paths),
+        lambda: _resolve_base_dir(task_id, container_paths=container_paths),
+        container_paths,
+    )
+    kanban_workspace = _sentinel_free_abs_cwd(
+        os.getenv("HERMES_KANBAN_WORKSPACE")
+        if os.getenv("HERMES_KANBAN_TASK")
+        else None
+    )
+    if kanban_workspace and not container_paths:
+        root = Path(kanban_workspace).resolve()
+        if not Path(resolved).is_relative_to(root):
+            raise PermissionError(
+                f"Kanban workspace containment: {str(resolved)!r} is outside "
+                f"the assigned workspace {str(root)!r}. Use a path inside the task worktree."
+            )
+    return resolved
 
 
 
