@@ -2551,6 +2551,16 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         # A multiplexer dispatching for another profile must not hand it the launch
         # profile's .env settings / TERMINAL_* policy — a standalone dispatcher never would.
         strip_launch_profile_env(env, profile_home)
+    # An operator may install a non-interactive shell policy at the gateway
+    # service boundary.  Profile isolation removes launch-profile variables,
+    # but BASH_ENV is process policy rather than a profile secret; restore the
+    # explicitly configured value so every Kanban worker and its terminal
+    # shells inherit the same guard.  Project-specific behavior remains inside
+    # the sourced file, which can inspect HERMES_KANBAN_BOARD below.
+    if os.environ.get("BASH_ENV"):
+        env["BASH_ENV"] = os.environ["BASH_ENV"]
+    if os.environ.get("PROSPECT_ALLOW_MERGE"):
+        env["PROSPECT_ALLOW_MERGE"] = os.environ["PROSPECT_ALLOW_MERGE"]
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
