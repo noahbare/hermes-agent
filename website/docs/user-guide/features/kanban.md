@@ -63,8 +63,36 @@ re-reads the PR head/base. Optional failed/skipped telemetry does not veto accep
 required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
 neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
-checks needs a local-only contract. `gh` must be authenticated with read access to
+checks needs an explicit workflow process gate (below), or a local-only contract
+for intentionally non-CI work. `gh` must be authenticated with read access to
 the repository's checks and rules; no remote writes are performed by this gate.
+
+### Opt-in repository workflow gates
+
+For repositories that use workflow policy without branch-required contexts, configure
+the owning Hermes home's `config.yaml` explicitly:
+
+```yaml
+kanban:
+  pr_workflow_gates:
+    OWNER/REPO:
+      - .github/workflows/ci.yml
+```
+
+This process gate supplements every successfully discovered branch-required context;
+it does not invent branch protection or waive checks. Only GitHub's exact HTTP 403
+private-plan-not-supported response may be recorded as unavailable branch-rules
+provenance when an explicit workflow gate is configured. Generic permission/authentication
+errors, malformed responses and incomplete pagination still fail closed.
+
+Expected jobs come from each configured workflow file at the exact PR head. All must
+be present and completed successfully in the newest workflow run and current attempt
+on that head. Missing, queued, failed, skipped or cancelled jobs block completion, even
+if an older run or unrelated check is green. Matrix strategies, reusable jobs, dynamic
+job names and ambiguous inventories are currently unsupported and fail closed.
+The collector rereads the run/attempt, latest run and PR head/base before accepting.
+Receipts retain configuration provenance, workflow/blob identity, expected inventory,
+run/attempt and job outcomes. Empty legacy status contexts do not veto workflow success.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
 store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery

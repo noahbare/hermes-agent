@@ -1,8 +1,10 @@
-"""Two lifecycle invariants, using real SQLite and a local GitHub HTTP contract."""
+"""Exact-head lifecycle invariants, using real SQLite and a local GitHub HTTP contract."""
 import json
+import base64
 import os
 import sys
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -24,8 +26,46 @@ def github(tmp_path, monkeypatch):
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                if state.get("no_branch_checks"):
+                    value["data"]["repository"]["pullRequest"]["baseRef"] = None
             elif "/rules/branches/" in self.path:
+                if state.get("policy_error"):
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "403", "message": state["policy_error"]}).encode())
+                    return
                 value = [[]]
+                if state.get("rules_checks"):
+                    value = [[{"type": "required_status_checks", "parameters": {
+                        "required_status_checks": [{"context": "required", "integration_id": 1}]}}]]
+            elif "/contents/" in self.path:
+                source = state.get("workflow", "jobs:\n  build:\n    name: Build\n    runs-on: ubuntu-latest\n    steps: []\n")
+                value = {"path": ".github/workflows/ci.yml", "type": "file", "encoding": "base64",
+                         "sha": "c" * 40, "content": base64.b64encode(source.encode()).decode()}
+            elif "/actions/workflows/ci.yml" in self.path:
+                value = {"id": 10, "path": ".github/workflows/ci.yml"}
+            elif "/actions/" in self.path:
+                run = {"id": 100, "workflow_id": 10, "head_sha": sha, "path": ".github/workflows/ci.yml",
+                       "run_number": 1, "run_attempt": 1, "status": "completed", "conclusion": "success",
+                       "html_url": "https://github.com/acme/repo/actions/runs/100"}
+                if state.get("wrong_workflow_head"):
+                    run["head_sha"] = "b" * 40
+                if "/jobs?" in self.path:
+                    job = {"id": 101, "run_id": 100, "head_sha": sha, "name": state.get("job_name", "Build"),
+                           "status": state.get("job_status", "completed"), "conclusion": state.get("job_conclusion", "success")}
+                    if state.get("wrong_job_head"):
+                        job["head_sha"] = "b" * 40
+                    jobs = [] if state.get("missing_job") else [job]
+                    value = [{"total_count": len(jobs) + int(state.get("bad_job_pages", False)), "jobs": jobs}]
+                    if state.get("workflow_head_race"):
+                        state["head"] = "b" * 40
+                elif "/runs?" in self.path:
+                    runs = [] if state.get("missing_run") else [run]
+                    if state.get("newer_failed"):
+                        runs.append({**run, "id": 200, "run_number": 2, "conclusion": "failure"})
+                    value = [{"total_count": len(runs) + int(state.get("bad_run_pages", False)), "workflow_runs": runs}]
+                else:
+                    value = {**run, "run_attempt": 2} if state.get("attempt_race") else run
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
                        "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
@@ -60,9 +100,12 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,json\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n value=json.loads(urllib.request.urlopen(u).read())\n"
+                  " if '--paginate' in sys.argv:\n  for page in value: print(json.dumps(page))\n"
+                  " else: print(json.dumps(value))\n"
+                  "except urllib.error.HTTPError as e:\n print(e.read().decode()); sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -129,3 +172,63 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             assert kb.get_task(conn, tid).status != "done"
             assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
             github.pop("race")
+
+
+@pytest.mark.linux_only
+def test_configured_workflow_gate_is_exact_complete_and_additive(github):
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(exist_ok=True)
+    (home / "config.yaml").write_text("kanban:\n  pr_workflow_gates:\n    acme/repo: [.github/workflows/ci.yml]\n")
+    plan_error = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+    github.update(policy_error=plan_error, no_branch_checks=True)
+    cases = [({}, True), ({"missing_job": True}, False),
+             ({"job_status": "queued"}, False), ({"job_status": "in_progress"}, False),
+             *[({"job_conclusion": c}, False) for c in ("failure", "skipped", "cancelled", None)],
+             ({"wrong_workflow_head": True}, False), ({"wrong_job_head": True}, False),
+             ({"missing_run": True}, False),
+             ({"newer_failed": True}, False), ({"workflow_head_race": True}, False),
+             ({"attempt_race": True}, False), ({"bad_job_pages": True}, False),
+             ({"bad_run_pages": True}, False), ({"job_name": "Unrelated green job"}, False),
+             ({"policy_error": "Resource not accessible by integration"}, False),
+             ({"no_branch_checks": False, "conclusion": "failure"}, False),
+             ({"no_branch_checks": False, "conclusion": "success"}, True),
+             ({"policy_error": None, "rules_checks": True, "conclusion": "failure"}, False),
+             ({"policy_error": None, "rules_checks": True}, True),
+             *[({"workflow": source}, False) for source in (
+                 "jobs:\n  build:\n    strategy: {matrix: {os: [linux, macos]}}\n",
+                 "jobs:\n  build:\n    name: '${{ matrix.os }}'\n",
+                 "jobs:\n  build:\n    uses: acme/shared/.github/workflows/build.yml@main\n",
+                 "jobs: {}\n", "jobs: [\n")]]
+    with connect() as conn:
+        for faults, expected in cases:
+            github.update(faults)
+            tid = kb.create_task(conn, title="Gate", completion_contract="acme/repo")
+            assert kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"}) is expected, faults
+            assert (kb.get_task(conn, tid).status == "done") is expected
+            receipt = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+                                             (tid,)).fetchone()[0])
+            if expected:
+                if github.get("policy_error"):
+                    assert receipt["unavailable_policy"][0]["reason"] == "private-plan-not-supported"
+                assert receipt["workflows"][0]["expected_jobs"] == [{"job_id": "build", "name": "Build"}]
+                assert receipt["workflows"][0]["run_id"] == 100
+            for key in faults:
+                github.pop(key, None)
+            github.update(head="a" * 40, conclusion="success", policy_error=plan_error, no_branch_checks=True)
+
+
+@pytest.mark.linux_only
+def test_workflow_policy_is_opt_in_and_scoped_to_current_home(github, tmp_path, monkeypatch):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+    plan_error = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+    github.update(policy_error=plan_error, no_branch_checks=True)
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home, repo in zip(homes, ("acme/repo", "other/repo")):
+        home.mkdir()
+        (home / "config.yaml").write_text(f"kanban:\n  pr_workflow_gates:\n    {repo}: [.github/workflows/ci.yml]\n")
+    for home, expected in ((homes[0], True), (homes[1], False), (homes[0], True)):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        receipt = collect_acceptance("https://github.com/acme/repo/pull/7", None)
+        assert receipt["ok"] is expected
+    (homes[0] / "config.yaml").write_text("kanban:\n  pr_workflow_gates: {acme/repo: []}\n")
+    assert not collect_acceptance("https://github.com/acme/repo/pull/7", None)["ok"]
