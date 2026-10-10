@@ -6,7 +6,7 @@ import re
 from typing import Any, Callable
 from urllib.parse import quote
 
-import yaml
+from hermes_cli.config import yaml
 
 from hermes_cli.config_effective import load_user_config_effective
 

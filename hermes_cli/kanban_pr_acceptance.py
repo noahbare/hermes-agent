@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-import yaml
+from hermes_cli.config import yaml
 
 from hermes_cli.kanban_pr_workflows import collect_workflow, complete_pages, configured_workflows
 
