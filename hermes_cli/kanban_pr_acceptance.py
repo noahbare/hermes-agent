@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from functools import partial
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -27,14 +29,33 @@ def validate_contract(value: str | None) -> str:
     return value
 
 
-def _api(endpoint: str, *, query: str | None = None, paginate: bool = False) -> Any:
+def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
+         profile_home: str | None = None) -> Any:
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
     if query is not None:
         command += ["-f", "query=" + query]
     if paginate:
         command += ["--paginate"]
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                            text=True, timeout=30, check=True)
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=30,
+                                check=True, env=_gh_env(profile_home))
+    except subprocess.CalledProcessError as exc:
+        # Keep only the exact rules-plan denial eligible for opt-in policy.
+        try:
+            error = json.loads(exc.stdout or "{}")
+        except ValueError:
+            error = {}
+        if ("/rules/branches/" in endpoint and isinstance(error, dict)
+                and error.get("status") == "403" and error.get("message") == (
+                    "Upgrade to GitHub Pro or make this repository public to enable this feature.")):
+            raise
+        denied = re.search(r"HTTP (40[134])", exc.stderr or "")
+        if denied:
+            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
+        if exc.returncode == 4:
+            raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
+        raise
     if paginate:
         # gh --slurp is absent in older supported installations. --paginate emits
         # consecutive JSON documents; decode every page without discarding any.
@@ -54,13 +75,57 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False) -> 
     return value
 
 
-def collect_acceptance(contract: str, published_pr: str | None) -> dict:
+class _GateAuthError(RuntimeError):
+    """The assignee's login cannot read the acceptance repository."""
+
+
+def _gh_env(profile_home: str | None) -> dict[str, str] | None:
+    """Child env for ``gh``: the card's profile identity when one is resolvable.
+
+    The completion boundary runs in the worker (assignee), the CLI, or a
+    reviewer/dispatcher turn, so an ambient ``gh`` login is whichever process
+    happened to call it (#122689). ``served_profile_child_env(inherit_credentials=True)``
+    is the seam for "this child acts for that profile": it scrubs the launch
+    profile's credential residue and overlays the target profile's own
+    ``GH_TOKEN``/``GH_CONFIG_DIR`` (its ``.env`` + external secret sources).
+    ``None`` keeps the ambient env — unassigned cards behave exactly as before.
+    """
+    if not profile_home:
+        return None
+    from tools.environments.local import _is_routed_home, hermes_subprocess_env, served_profile_child_env
+    base = hermes_subprocess_env(inherit_credentials=True)
+    routed = _is_routed_home(profile_home)
+    if routed:
+        base.pop("GH_CONFIG_DIR", None)
+    env = served_profile_child_env(base=base, target_home=profile_home, inherit_credentials=True)
+    if routed and not (env.keys() & {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"}):
+        env["GH_CONFIG_DIR"] = str(Path(profile_home) / "gh")
+    return env
+
+
+def _assignee_profile_home(assignee: str | None) -> str | None:
+    """Home whose ``gh`` login must read the contract repo — the assignee's, resolved
+    exactly as the dispatcher resolves the worker's home — or None (unassigned) so the
+    ambient login is used. An assigned card whose profile cannot be resolved is an
+    identity failure (``auth``), never a silent fall-through to the ambient login."""
+    if not assignee:
+        return None
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    try:
+        return resolve_profile_env(normalize_profile_name(assignee))
+    except (FileNotFoundError, ValueError):
+        raise _GateAuthError(f"assignee profile {assignee!r} cannot be resolved") from None
+
+
+def collect_acceptance(contract: str, published_pr: str | None,
+                       assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
                "pr_url": published_pr, "checks": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
         declared = _PR.fullmatch(contract)
+        api = partial(_api, profile_home=_assignee_profile_home(assignee))
         url = contract if declared else published_pr
         match = _PR.fullmatch(url or "")
         if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
@@ -73,7 +138,10 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
             baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
                 json.dumps(owner), json.dumps(name), number)
-        pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
+        repository = api("graphql", query=query)["data"]["repository"]
+        if repository is None:
+            raise _GateAuthError(f"HTTP 404 on graphql {repo}")
+        pr = repository["pullRequest"]
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
@@ -83,7 +151,7 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                     for r in protection["requiredStatusChecks"]} if protection is not None else set()
         receipt["policy_sources"] = ["github:branchProtectionRule", "github:branch-rules"]
         try:
-            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+            rules = api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
         except subprocess.CalledProcessError as exc:
             # Only GitHub's exact private-plan limitation is eligible for the opt-in gate.
             # Generic permission/auth failures are not evidence that policy is absent.
@@ -108,9 +176,9 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         if not required and not workflows:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
-        pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
+        pages = api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
         runs = complete_pages(pages, "check_runs")
-        statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True) for s in page]
+        statuses = [{**s, "sha": sha} for page in api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True) for s in page]
         outcomes = []
         for context, app_id in sorted(required, key=lambda item: str(item)):
             matching = [r for r in runs if r["name"] == context and
@@ -131,14 +199,20 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                     "head_sha": check.get("head_sha", check.get("sha")),
                     "classification": classification, "conclusion": outcome})
         for path in workflows:
-            outcomes.extend(collect_workflow(_api, repo, path, sha, receipt))
+            outcomes.extend(collect_workflow(api, repo, path, sha, receipt))
         # Re-read after all pages: old-head successes are never transferable.
-        current = _api(f"repos/{repo}/pulls/{number}")
+        current = api(f"repos/{repo}/pulls/{number}")
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
+        return receipt
+    except _GateAuthError as exc:
+        login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
+        receipt.update(classification="auth",
+                       detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
+                              "fix that profile's GitHub credentials/access to the repository, then retry completion.")
         return receipt
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError,
             AttributeError, yaml.YAMLError):

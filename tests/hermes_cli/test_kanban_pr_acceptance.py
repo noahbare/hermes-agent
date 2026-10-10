@@ -20,6 +20,7 @@ def github(tmp_path, monkeypatch):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             state["requests"].append(self.path)
+            state.setdefault("identities", []).append(self.headers.get("X-Test-Gh-Token"))
             sha = state["head"]
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
@@ -100,12 +101,14 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,json\n"
+    gh.write_text(f"#!{sys.executable}\nimport sys,os,urllib.request,json\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "try:\n value=json.loads(urllib.request.urlopen(u).read())\n"
+                  "if '--slurp' in sys.argv: sys.exit(2)\n"
+                  "request=urllib.request.Request(u, headers={'X-Test-Gh-Token': os.getenv('GH_TOKEN', '')})\n"
+                  "try:\n value=json.loads(urllib.request.urlopen(request).read())\n"
                   " if '--paginate' in sys.argv:\n  for page in value: print(json.dumps(page))\n"
                   " else: print(json.dumps(value))\n"
-                  "except urllib.error.HTTPError as e:\n print(e.read().decode()); sys.exit(1)\n")
+                  "except urllib.error.HTTPError as e:\n print(e.read().decode()); print('HTTP '+str(e.code), file=sys.stderr); sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -232,3 +235,34 @@ def test_workflow_policy_is_opt_in_and_scoped_to_current_home(github, tmp_path, 
         assert receipt["ok"] is expected
     (homes[0] / "config.yaml").write_text("kanban:\n  pr_workflow_gates: {acme/repo: []}\n")
     assert not collect_acceptance("https://github.com/acme/repo/pull/7", None)["ok"]
+
+
+@pytest.mark.linux_only
+def test_workflow_pages_and_head_reread_keep_assignee_identity(github, monkeypatch):
+    home = Path(os.environ["HERMES_HOME"])
+    profile = home / "profiles" / "b"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("GH_TOKEN=b-token\n", encoding="utf-8")
+    (home / "config.yaml").write_text("kanban:\n  pr_workflow_gates:\n    acme/repo: [.github/workflows/ci.yml]\n")
+    monkeypatch.setenv("GH_TOKEN", "launch-token")
+    github.update(policy_error="Upgrade to GitHub Pro or make this repository public to enable this feature.",
+                  no_branch_checks=True)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Profile workflow", assignee="b", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+    assert any("/contents/" in path for path in github["requests"])
+    assert github["requests"][-1].endswith("/pulls/7")
+    assert set(github["identities"]) == {"b-token"}
+
+
+@pytest.mark.linux_only
+def test_generic_rules_permission_denial_is_auth_even_with_workflow_opt_in(github):
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(exist_ok=True)
+    (home / "config.yaml").write_text("kanban:\n  pr_workflow_gates:\n    acme/repo: [.github/workflows/ci.yml]\n")
+    github.update(policy_error="Resource not accessible by integration", no_branch_checks=True)
+    receipt = collect_acceptance("https://github.com/acme/repo/pull/7", None)
+    assert not receipt["ok"] and receipt["classification"] == "auth"
+    assert "HTTP 403" in receipt["detail"]
+    assert not any("/actions/" in path for path in github["requests"])

@@ -22,14 +22,15 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
     # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
-    if match and contract == match[1]:
+    if isinstance(published_pr, str) and match and contract == match[1]:
         with write_txn(conn):
             if _snapshot(conn, task_id) != snapshot:
                 return False
             conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
         snapshot = (run_id, status, published_pr)
         contract = published_pr
-    return snapshot, collect_acceptance(contract, published_pr)
+    assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
+    return snapshot, collect_acceptance(contract, published_pr, assignee=assignee)
 
 
 def record_acceptance(conn, task_id, acceptance):
